@@ -19,6 +19,7 @@ PkkMind 是一个企业级智能客服系统，核心链路为：
 ```text
 PkkMind/
 ├── api/main.py                    # FastAPI 入口，/chat /search /knowledge /monitor /eval
+├── core/llm_client.py             # Anthropic / OpenAI 统一文本模型客户端
 ├── core/intent_recognizer.py      # 三路融合意图识别
 ├── agents/agent_orchestrator.py   # 多 Agent 路由编排
 ├── memory/conversation_memory.py  # Redis + ChromaDB 记忆管理
@@ -39,7 +40,7 @@ PkkMind/
 
 - Docker
 - Docker Compose
-- Anthropic API Key，或兼容 Anthropic 协议的第三方 API Key
+- Anthropic、OpenAI，或相应兼容协议的第三方 API Key
 
 ### 2.2 配置 `.env`
 
@@ -52,6 +53,7 @@ cp .env.example .env
 最少需要配置：
 
 ```env
+LLM_PROVIDER=anthropic
 ANTHROPIC_API_KEY=your_api_key
 ```
 
@@ -62,6 +64,27 @@ ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
 ANTHROPIC_MODEL=deepseek-v4-pro
 ANTHROPIC_API_KEY=your_deepseek_key
 ```
+
+使用原生 OpenAI 时，推荐使用 Responses API：
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_openai_key
+OPENAI_MODEL=gpt-5-mini
+OPENAI_API_STYLE=responses
+```
+
+使用 GLM、Kimi 等 OpenAI 兼容接口时，填写服务商提供的 `/v1` 地址和模型名；若其不支持 Responses API，切换为 Chat Completions：
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_provider_key
+OPENAI_MODEL=your_model_name
+OPENAI_BASE_URL=https://provider.example/v1
+OPENAI_API_STYLE=chat_completions
+```
+
+本次兼容仅涉及文本模型调用。Embedding 的远端模型选择逻辑保持不变，未配置或客户端不支持时仍按原逻辑使用本地 n-gram。
 
 Docker Compose 场景下，Redis 和 ChromaDB 的连接由 `docker-compose.yml` 覆盖为容器内地址。通常不需要手动改：
 
@@ -1275,7 +1298,7 @@ docker compose logs -f pkkmind
 
 重点检查：
 
-- `.env` 是否配置 `ANTHROPIC_API_KEY`
+- `.env` 中的 `LLM_PROVIDER` 是否与对应的 API Key、模型名匹配
 - Redis 是否健康
 - ChromaDB 是否健康
 - 应用容器是否正在反复重启

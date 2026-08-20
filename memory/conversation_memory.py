@@ -23,8 +23,6 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 import redis.asyncio as redis
-from anthropic import AsyncAnthropic
-
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
@@ -90,14 +88,10 @@ class MemoryManager:
         chroma_host:  str = "localhost",
         chroma_port:  int = 8000,
         chroma_path:  str = "./data/chroma",
-        api_key:      str = "",
-        base_url:     Optional[str] = None,
+        client:       Any = None,
         model:        str = "claude-3-5-sonnet-20241022",
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        self._client = client
         self._model  = model
 
         self._redis = redis.from_url(redis_url, decode_responses=True)

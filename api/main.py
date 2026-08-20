@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+from core.llm_client import create_llm_client, load_llm_config
+
 load_dotenv()
 
 logging.basicConfig(
@@ -68,20 +70,6 @@ _monitor      = None
 _evaluator    = None
 _skill_manager = None
 
-def _anthropic_cfg() -> Dict[str, Any]:
-    key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
-        raise RuntimeError("未设置 ANTHROPIC_API_KEY")
-    cfg: Dict[str, Any] = {
-        "api_key":  key,
-        "model":    os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022").strip(),
-    }
-    base_url = os.getenv("ANTHROPIC_BASE_URL", "").strip()
-    if base_url:
-        cfg["base_url"] = base_url
-    return cfg
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor, _evaluator, _skill_manager
@@ -97,14 +85,22 @@ async def lifespan(app: FastAPI):
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
 
-    cfg = _anthropic_cfg()
-    logger.info(f"模型: {cfg['model']}  base_url: {cfg.get('base_url', '(官方)')}")
+    cfg = load_llm_config()
+    client = create_llm_client(cfg)
+    embedding_enabled = not bool(cfg.base_url)
+    logger.info(
+        "LLM provider: %s  model: %s  api_style: %s  base_url: %s",
+        cfg.provider,
+        cfg.model,
+        cfg.api_style,
+        cfg.base_url or "(官方)",
+    )
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
     recognizer = IntentRecognizer(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
+        embedding_enabled=embedding_enabled,
     )
 
     # Skills：启动时从目录加载业务能力说明，并在 Agent 调用 LLM 时动态注入。
@@ -117,9 +113,9 @@ async def lifespan(app: FastAPI):
 
     # Agent 编排器
     _orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
+        embedding_enabled=embedding_enabled,
         skill_manager=_skill_manager,
     )
 
@@ -129,16 +125,14 @@ async def lifespan(app: FastAPI):
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
     )
 
     # MCP 工具管理器 + RAG 知识库（基于 ChromaDB 的真实检索）
     _tool_manager = MCPToolManager(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
     )
     kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
@@ -189,9 +183,8 @@ async def lifespan(app: FastAPI):
     _evaluator = EndToEndEvaluator(
         orchestrator=_orchestrator,
         recognizer=recognizer,
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
         baseline_path=os.getenv("EVAL_BASELINE_PATH", "/app/data/eval/baseline.json"),
     )
 
@@ -607,16 +600,18 @@ async def _cli():
     from memory.conversation_memory import MemoryManager, MsgRole
     from core.skill_loader import SkillManager
 
-    cfg = _anthropic_cfg()
+    cfg = load_llm_config()
+    client = create_llm_client(cfg)
+    embedding_enabled = not bool(cfg.base_url)
     skill_manager = SkillManager(
         root_dir=os.getenv("PKKMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
         max_prompt_chars=int(os.getenv("PKKMIND_SKILLS_MAX_PROMPT_CHARS", "5000")),
     )
     skill_manager.load()
     orch = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
+        embedding_enabled=embedding_enabled,
         skill_manager=skill_manager,
     )
     mem  = MemoryManager(
@@ -624,9 +619,8 @@ async def _cli():
         chroma_host=os.getenv("CHROMA_HOST", "localhost"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/tmp/chroma"),
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
+        client=client,
+        model=cfg.model,
     )
 
     user_id, conv_id = "cli_user", str(uuid.uuid4())

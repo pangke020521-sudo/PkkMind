@@ -23,8 +23,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from anthropic import AsyncAnthropic
-
 from core.llm_utils import extract_text_content
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer
@@ -106,7 +104,7 @@ Agent 响应: {response}
 
 只返回 JSON，例如: {{"relevance": 0.9, "accuracy": 0.8, "completeness": 0.7, "helpfulness": 0.85}}"""
 
-    def __init__(self, client: AsyncAnthropic, model: str):
+    def __init__(self, client: Any, model: str):
         self._client = client
         self._model  = model
 
@@ -228,16 +226,10 @@ class EndToEndEvaluator:
         self,
         orchestrator,
         recognizer: IntentRecognizer,
-        api_key:  str,
-        base_url: Optional[str] = None,
+        client: Any,
         model:    str = "claude-3-5-sonnet-20241022",
         baseline_path: Optional[str] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
-
         self._orchestrator     = orchestrator
         self._judge            = LLMJudge(client, model)
         self._intent_evaluator = IntentEvaluator(recognizer)

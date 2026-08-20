@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from anthropic import AsyncAnthropic
-
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
@@ -147,21 +145,17 @@ class IntentRecognizer:
 
     def __init__(
         self,
-        api_key: str,
-        base_url: Optional[str] = None,
+        client: Any,
         model: str = "claude-3-5-sonnet-20241022",
         confidence_threshold: float = 0.5,
+        embedding_enabled: bool = True,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client    = AsyncAnthropic(**kwargs)
+        self.client    = client
         self.model     = model
         self.threshold = confidence_threshold
-        # 第三方兼容 API（如 DeepSeek）通常不支持 Embedding，禁用该策略。
-        # 官方 Anthropic SDK 当前没有 embeddings 资源，因此下面会使用稳定的
-        # 本地字符 n-gram 向量作为轻量兜底，保证三路融合链路真实可跑。
-        self._embedding_enabled = not bool(base_url)
+        # 是否允许尝试远端 Embedding 仍沿用现有配置语义；客户端没有 embeddings
+        # 资源时会继续使用本地字符 n-gram，不在本次文本模型兼容改动中扩展。
+        self._embedding_enabled = embedding_enabled
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
         self._cache: Dict[str, IntentResult] = {}

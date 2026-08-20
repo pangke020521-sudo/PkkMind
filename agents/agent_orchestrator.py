@@ -24,8 +24,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from anthropic import AsyncAnthropic
-
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
 
@@ -129,7 +127,7 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
 
-    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
+    def __init__(self, client: Any, model: str, skill_manager: Optional[Any] = None):
         self._client = client
         self._model  = model
         self._skill_manager = skill_manager
@@ -253,17 +251,16 @@ class AgentOrchestrator:
 
     def __init__(
         self,
-        api_key:  str,
-        base_url: Optional[str] = None,
+        client: Any,
         model:    str = "claude-3-5-sonnet-20241022",
+        embedding_enabled: bool = True,
         skill_manager: Optional[Any] = None,
     ):
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
-
-        self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
+        self._intent_recognizer = IntentRecognizer(
+            client=client,
+            model=model,
+            embedding_enabled=embedding_enabled,
+        )
         self._skill_manager = skill_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
