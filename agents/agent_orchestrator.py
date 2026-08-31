@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_client import LLMRuntime
@@ -37,7 +37,22 @@ class AgentType(Enum):
     GENERAL   = "general"    # 通用客服
     TECHNICAL = "technical"  # 技术支持
     BILLING   = "billing"    # 账单/退款
-    ESCALATION = "escalation" # 人工升级（占位）
+    ESCALATION = "escalation" # 人工升级与交接
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """A structured role contract shared by prompts, monitoring and tests."""
+
+    role: str
+    mission: str
+    workflow: Tuple[str, ...]
+    input_contract: Tuple[str, ...]
+    output_contract: Tuple[str, ...]
+    handoff_conditions: Tuple[str, ...] = ()
+    tool_scope: Tuple[str, ...] = ()
+    temperature: float = 0.2
+    max_tokens: int = 1024
 
 
 @dataclass
@@ -123,10 +138,11 @@ class RoutingDecision:
 # ── 基础 Agent ────────────────────────────────────────────────────────────────
 
 class BaseAgent:
-    """所有 Agent 的基类，封装 LLM 调用和统计。"""
+    """所有 Agent 的基类，封装 LLM 调用、角色契约和统计。"""
 
     agent_type: AgentType
     system_prompt: str
+    profile: AgentProfile
 
     def __init__(
         self,
@@ -134,10 +150,12 @@ class BaseAgent:
         model: str,
         skill_manager: Optional[Any] = None,
         provider: str = "unknown",
+        profile: Optional[AgentProfile] = None,
     ):
         self._client = client
         self._model  = model
         self._provider = provider
+        self.profile = profile or self.profile
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
 
@@ -180,24 +198,54 @@ class BaseAgent:
             entities_text = json.dumps(req.entities, ensure_ascii=False)
             messages.append({"role": "user", "content": f"[结构化实体]\n{_clean(entities_text)}"})
             messages.append({"role": "assistant", "content": "好的，我会结合这些结构化实体处理。"})
+        role_packet = self._build_role_packet(req)
+        if role_packet:
+            messages.append({"role": "user", "content": f"[角色输入契约]\n{_clean(role_packet)}"})
+            messages.append({"role": "assistant", "content": "好的，我会按照该角色的输入和输出契约处理。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
         resp = await self._client.messages.create(
             model=self._model,
-            max_tokens=1024,
+            max_tokens=self.profile.max_tokens,
+            temperature=self.profile.temperature,
             system=self._build_system_prompt(req),
             messages=messages,
         )
         return extract_text_content(resp.content)
 
     def _build_system_prompt(self, req: Request) -> str:
-        """把动态加载的 Skills 拼入 system prompt，让业务规则随请求生效。"""
+        """把角色契约和动态加载的 Skills 拼入 system prompt。"""
+        profile_prompt = (
+            "\n\n[角色契约]\n"
+            f"角色：{self.profile.role}\n"
+            f"职责：{self.profile.mission}\n"
+            f"处理流程：{' -> '.join(self.profile.workflow)}\n"
+            f"可用输入：{'；'.join(self.profile.input_contract)}\n"
+            f"输出要求：{'；'.join(self.profile.output_contract)}\n"
+            f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
+            f"工具范围声明：{'、'.join(self.profile.tool_scope) or '当前未声明专属工具'}\n"
+            "不得声称执行了系统未实际提供的查询、修改、退款或工单操作；"
+            "缺少证据时必须明确说明需要进一步核验。"
+        )
+        base_prompt = f"{self.system_prompt}{profile_prompt}"
         if self._skill_manager is None:
-            return self.system_prompt
+            return base_prompt
         skill_prompt = self._skill_manager.prompt_for(req.message, self.agent_type.value)
         if not skill_prompt:
-            return self.system_prompt
-        return f"{self.system_prompt}\n\n[动态 Skills]\n{skill_prompt}"
+            return base_prompt
+        return f"{base_prompt}\n\n[动态 Skills]\n{skill_prompt}"
+
+    def _build_role_packet(self, req: Request) -> str:
+        """构造给当前 Agent 的确定性输入摘要，子类可补充领域字段。"""
+        packet = {
+            "agent_type": self.agent_type.value,
+            "intent": req.intent.value if req.intent else None,
+            "intent_group": req.intent_group,
+            "urgency": req.urgency.name if req.urgency else None,
+            "intent_confidence": round(req.intent_confidence, 4),
+            "available_entities": req.entities or {},
+        }
+        return json.dumps(packet, ensure_ascii=False)
 
     def _needs_escalation(self, content: str) -> bool:
         """检测 Agent 是否建议升级（简单关键词检测）。"""
@@ -207,26 +255,149 @@ class BaseAgent:
 
 class GeneralAgent(BaseAgent):
     agent_type    = AgentType.GENERAL
+    profile = AgentProfile(
+        role="通用客服分诊与首轮接待",
+        mission="快速回答基础问题、澄清不完整需求，并识别是否需要专业 Agent 或人工处理。",
+        workflow=("复述诉求", "判断业务范围", "直接回答或补充必要信息", "给出下一步"),
+        input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
+        output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和能力边界"),
+        handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
+        tool_scope=("knowledge_search", "request_context", "required_fields"),
+        temperature=0.3,
+        max_tokens=900,
+    )
     system_prompt = (
         "你是 PkkMind 智能客服。友好、简洁地回答用户问题。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
     )
 
+    def _build_role_packet(self, req: Request) -> str:
+        packet = json.loads(super()._build_role_packet(req))
+        packet["triage_targets"] = ["technical", "billing", "escalation"]
+        packet["response_mode"] = "answer_or_clarify"
+        return json.dumps(packet, ensure_ascii=False)
+
 
 class TechnicalAgent(BaseAgent):
     agent_type    = AgentType.TECHNICAL
+    profile = AgentProfile(
+        role="技术故障诊断与排障",
+        mission="基于错误码、运行环境和复现信息缩小根因范围，提供低风险、可验证的排查步骤。",
+        workflow=("确认现象", "判断影响范围", "排查网络/权限/配置/依赖", "给出验证方式", "判断升级条件"),
+        input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
+        output_contract=("现象复述", "可能原因", "编号排查步骤", "验证方法", "需要补充的信息"),
+        handoff_conditions=("生产环境大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
+        tool_scope=("knowledge_search", "error_code_lookup", "diagnostic_plan"),
+        temperature=0.1,
+        max_tokens=1200,
+    )
     system_prompt = (
         "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
         "提供清晰的步骤化解决方案。遇到需要后台操作的问题，说明需要升级处理。"
     )
 
+    def _build_role_packet(self, req: Request) -> str:
+        packet = json.loads(super()._build_role_packet(req))
+        packet["diagnostic_fields"] = {
+            "error_codes": req.entities.get("error_code", []),
+            "environment_hint": "请从用户消息和背景中确认设备、系统、版本和网络",
+            "risk_boundary": "不得要求密码、短信验证码或完整密钥；不得建议破坏性操作",
+        }
+        return json.dumps(packet, ensure_ascii=False)
+
 
 class BillingAgent(BaseAgent):
     agent_type    = AgentType.BILLING
+    profile = AgentProfile(
+        role="账单核验与售后处理",
+        mission="区分扣款、退款、发票和订阅场景，解释可判断事实并明确人工审核边界。",
+        workflow=("确认账单场景", "收集必要核验字段", "区分订单/实付/退款金额", "说明处理路径与时效", "判断升级条件"),
+        input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
+        output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效与权限边界"),
+        handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
+        tool_scope=("knowledge_search", "billing_field_check", "amount_comparison"),
+        temperature=0.0,
+        max_tokens=1100,
+    )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
         "对财务问题保持准确和专业。涉及实际退款操作时，说明需要人工审核。"
     )
+
+    def _build_role_packet(self, req: Request) -> str:
+        packet = json.loads(super()._build_role_packet(req))
+        packet["verification_fields"] = {
+            "order_id": req.entities.get("order_id", []),
+            "amount": req.entities.get("amount", []),
+            "date": req.entities.get("date", []),
+            "missing_fields": [
+                field_name
+                for field_name, values in (
+                    ("订单号或交易号", req.entities.get("order_id", [])),
+                    ("支付金额", req.entities.get("amount", [])),
+                )
+                if not values
+            ],
+            "risk_boundary": "不得承诺退款成功、立即到账或直接修改账单",
+        }
+        return json.dumps(packet, ensure_ascii=False)
+
+
+class EscalationAgent(BaseAgent):
+    """确定性的人工升级交接节点，当前不调用 LLM 或外部人工系统。"""
+
+    agent_type = AgentType.ESCALATION
+    profile = AgentProfile(
+        role="人工升级与交接",
+        mission="确认升级原因、整理已知上下文并明确告知当前人工服务接入状态。",
+        workflow=("确认升级原因", "整理已知信息", "标记优先级", "生成交接摘要"),
+        input_contract=("用户消息", "意图", "紧急度", "结构化实体", "对话背景"),
+        output_contract=("升级原因", "已知信息摘要", "安全提醒", "真实服务状态说明"),
+        handoff_conditions=("用户明确要求人工", "CRITICAL 紧急度", "高风险或超出系统权限的场景"),
+        tool_scope=(),
+        temperature=0.0,
+        max_tokens=0,
+    )
+    system_prompt = "人工升级交接节点不调用 LLM。"
+
+    async def handle(self, req: Request) -> AgentResponse:
+        t0 = time.monotonic()
+        self.stats.total += 1
+
+        intent = req.intent.value if req.intent else "unknown"
+        urgency = req.urgency.name if req.urgency else "UNKNOWN"
+        known_entities = {
+            key: values
+            for key, values in (req.entities or {}).items()
+            if values
+        }
+        entity_text = json.dumps(known_entities, ensure_ascii=False) if known_entities else "暂无结构化信息"
+        if req.urgency == UrgencyLevel.CRITICAL:
+            reason = "请求紧急度为 CRITICAL，需要人工核验"
+        elif req.intent in (IntentCategory.ESCALATION, IntentCategory.HUMAN_HANDOFF):
+            reason = "用户诉求被识别为人工升级或人工客服请求"
+        else:
+            reason = "当前问题超出普通 Agent 的安全处理边界"
+
+        content = (
+            "该问题已被标记为需要人工处理。\n\n"
+            f"升级原因：{reason}\n"
+            f"意图与紧急度：{intent} / {urgency}\n"
+            f"已记录信息：{entity_text}\n\n"
+            "重要说明：PkkMind 当前尚未接入正式的人工客服、工单系统或通知渠道。"
+            "本次仅生成交接信息，不代表已经创建真实工单，也不会自动通知人工客服。\n"
+            "请勿发送密码、短信验证码、完整银行卡号或完整支付凭证。"
+        )
+        latency_ms = (time.monotonic() - t0) * 1000
+        self.stats.success += 1
+        self.stats.total_ms += latency_ms
+        return AgentResponse(
+            agent_type=self.agent_type,
+            content=content,
+            success=True,
+            latency_ms=latency_ms,
+            escalate=True,
+        )
 
 
 # ── 编排器 ────────────────────────────────────────────────────────────────────
@@ -284,6 +455,12 @@ class AgentOrchestrator:
             )],
             AgentType.BILLING: [self._make_agent(
                 BillingAgent, AgentType.BILLING, client, model, provider, skill_manager
+            )],
+            AgentType.ESCALATION: [EscalationAgent(
+                client,
+                "deterministic",
+                skill_manager,
+                provider="none",
             )],
         }
 
@@ -642,7 +819,7 @@ class AgentOrchestrator:
         response = await agent.handle(req)
 
         # 专属 Agent 失败时降级到 GeneralAgent
-        if not response.success and agent_type != AgentType.GENERAL:
+        if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
@@ -665,6 +842,14 @@ class AgentOrchestrator:
                     "routing_score": round(agent.stats.routing_score(), 3),
                     "provider": agent._provider,
                     "model": agent._model,
+                    "role": agent.profile.role,
+                    "workflow": list(agent.profile.workflow),
+                    "input_contract": list(agent.profile.input_contract),
+                    "output_contract": list(agent.profile.output_contract),
+                    "handoff_conditions": list(agent.profile.handoff_conditions),
+                    "tool_scope": list(agent.profile.tool_scope),
+                    "temperature": agent.profile.temperature,
+                    "max_tokens": agent.profile.max_tokens,
                 }
         return result
 

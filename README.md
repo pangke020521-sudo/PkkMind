@@ -524,7 +524,7 @@ curl -X POST http://localhost:8000/chat \
 | `conv_id` | 会话 ID，相同 `conv_id` 表示同一轮多轮对话 |
 | `intent` | 识别出的意图 |
 | `agent_type` | 实际处理请求的 Agent |
-| `escalated` | 是否触发升级/转人工 |
+| `escalated` | 是否触发逻辑升级；当前不代表已经接入或通知正式人工客服 |
 | `latency_ms` | 端到端延迟 |
 
 ### 6.2 多轮对话
@@ -584,6 +584,34 @@ curl -X POST http://localhost:8000/chat \
 ```
 
 这类问题会触发多 Agent 并行协作，由技术 Agent 和账单 Agent 分别处理后合并回复。
+
+### 6.6 Agent 角色契约
+
+General、Technical、Billing Agent 除了使用不同的 system prompt，还分别声明角色、
+职责、工作流、输入契约、输出契约、升级条件、能力范围和生成参数。运行时会把角色
+契约以及本次请求的意图、紧急度和结构化实体一起传给对应 Agent。
+
+| Agent | 主要职责 | Temperature | Max Tokens |
+|-------|----------|-------------|------------|
+| `general` | 首轮接待、需求澄清和业务分诊 | `0.3` | `900` |
+| `technical` | 错误诊断和低风险排障 | `0.1` | `1200` |
+| `billing` | 账单核验、退款/发票路径说明 | `0.0` | `1100` |
+
+访问 `/health` 可以查看每个 Agent 实际使用的 provider、model、角色、工作流、
+输入输出契约及生成参数。`tool_scope` 当前是角色能力边界声明，真正的 Agent Tool
+Use 和运行时工具白名单尚未接入。
+
+### 6.7 人工升级 Agent
+
+当意图为 `escalation` / `human_handoff`，或者紧急度达到 `CRITICAL` 时，请求会
+进入确定性的 `EscalationAgent`。该节点不调用 LLM，而是整理升级原因、意图、
+紧急度和已提取实体，并返回安全提醒与交接说明，从而避免模型虚构“退款已完成”
+或“工单已创建”等结果。
+
+> **当前限制：PkkMind 尚未接入正式的人工客服、工单系统、消息通知或 Webhook。**
+> `escalated=true` 只表示系统在逻辑上判定该请求需要人工处理，并生成了交接信息；
+> 不代表已经创建真实工单，也不会自动通知人工客服。正式上线前需要在该节点接入
+> 企业客服平台或工单服务，并记录真实的工单编号和流转状态。
 
 ## 7. 知识库使用
 
