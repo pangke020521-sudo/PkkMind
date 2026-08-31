@@ -25,7 +25,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-from core.llm_client import create_llm_client, load_llm_config
+from core.llm_client import (
+    build_component_llm_runtimes,
+    create_llm_client,
+    load_llm_config,
+)
 
 load_dotenv()
 
@@ -76,7 +80,7 @@ async def lifespan(app: FastAPI):
 
     print(BANNER, flush=True)
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request
+    from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
     from mcp.knowledge_base import KnowledgeBase
@@ -87,6 +91,15 @@ async def lifespan(app: FastAPI):
 
     cfg = load_llm_config()
     client = create_llm_client(cfg)
+    component_runtimes = build_component_llm_runtimes(
+        ("general", "technical", "billing"),
+        default_config=cfg,
+        default_client=client,
+    )
+    agent_llms = {
+        AgentType(name): runtime
+        for name, runtime in component_runtimes.items()
+    }
     embedding_enabled = not bool(cfg.base_url)
     logger.info(
         "LLM provider: %s  model: %s  api_style: %s  base_url: %s",
@@ -95,6 +108,15 @@ async def lifespan(app: FastAPI):
         cfg.api_style,
         cfg.base_url or "(官方)",
     )
+    for agent_type, runtime in agent_llms.items():
+        logger.info(
+            "Agent LLM: %-9s provider=%s model=%s api_style=%s base_url=%s",
+            agent_type.value,
+            runtime.config.provider,
+            runtime.config.model,
+            runtime.config.api_style,
+            runtime.config.base_url or "(官方)",
+        )
 
     # 意图识别器（Orchestrator 内部也会创建，这里单独暴露给 Evaluator）
     recognizer = IntentRecognizer(
@@ -117,6 +139,8 @@ async def lifespan(app: FastAPI):
         model=cfg.model,
         embedding_enabled=embedding_enabled,
         skill_manager=_skill_manager,
+        provider=cfg.provider,
+        agent_llms=agent_llms,
     )
 
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
@@ -596,12 +620,21 @@ async def _cli():
     print(BANNER)
     print("PkkMind CLI — 输入 quit 退出\n")
 
-    from agents.agent_orchestrator import AgentOrchestrator, Request
+    from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
     from memory.conversation_memory import MemoryManager, MsgRole
     from core.skill_loader import SkillManager
 
     cfg = load_llm_config()
     client = create_llm_client(cfg)
+    component_runtimes = build_component_llm_runtimes(
+        ("general", "technical", "billing"),
+        default_config=cfg,
+        default_client=client,
+    )
+    agent_llms = {
+        AgentType(name): runtime
+        for name, runtime in component_runtimes.items()
+    }
     embedding_enabled = not bool(cfg.base_url)
     skill_manager = SkillManager(
         root_dir=os.getenv("PKKMIND_SKILLS_DIR", str(pathlib.Path(_ROOT) / "skills")),
@@ -613,6 +646,8 @@ async def _cli():
         model=cfg.model,
         embedding_enabled=embedding_enabled,
         skill_manager=skill_manager,
+        provider=cfg.provider,
+        agent_llms=agent_llms,
     )
     mem  = MemoryManager(
         redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),

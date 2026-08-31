@@ -1,8 +1,9 @@
 """Provider-neutral async text generation for Anthropic and OpenAI APIs."""
 from dataclasses import dataclass
 import os
+import re
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 
 _SUPPORTED_PROVIDERS = {"anthropic", "openai"}
@@ -16,6 +17,14 @@ class LLMConfig:
     model: str
     base_url: Optional[str] = None
     api_style: str = "messages"
+
+
+@dataclass(frozen=True)
+class LLMRuntime:
+    """A validated configuration paired with its provider SDK client."""
+
+    config: LLMConfig
+    client: Any
 
 
 def load_llm_config() -> LLMConfig:
@@ -55,6 +64,116 @@ def load_llm_config() -> LLMConfig:
         base_url=os.getenv("OPENAI_BASE_URL", "").strip() or None,
         api_style=api_style,
     )
+
+
+def load_component_llm_config(component: str, default: LLMConfig) -> LLMConfig:
+    """Load an optional component-specific LLM override.
+
+    Components use provider-neutral environment variables such as
+    ``PKKMIND_TECHNICAL_LLM_PROVIDER`` and ``PKKMIND_TECHNICAL_LLM_MODEL``.
+    Missing values inherit the global configuration when the provider stays the
+    same, or the selected provider's normal global variables when it changes.
+    """
+
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", component).strip("_").upper()
+    if not normalized:
+        raise ValueError("component 不能为空")
+    prefix = f"PKKMIND_{normalized}_LLM_"
+    override_keys = (
+        "PROVIDER",
+        "API_KEY",
+        "MODEL",
+        "BASE_URL",
+        "API_STYLE",
+    )
+    if not any(f"{prefix}{key}" in os.environ for key in override_keys):
+        return default
+
+    provider = os.getenv(f"{prefix}PROVIDER", default.provider).strip().lower()
+    if provider not in _SUPPORTED_PROVIDERS:
+        raise RuntimeError(
+            f"不支持的 {prefix}PROVIDER: {provider!r}，可选值为 anthropic 或 openai"
+        )
+
+    same_provider = provider == default.provider
+    if provider == "anthropic":
+        api_key = os.getenv(f"{prefix}API_KEY", "").strip()
+        if not api_key:
+            api_key = default.api_key if same_provider else os.getenv("ANTHROPIC_API_KEY", "").strip()
+        model = os.getenv(f"{prefix}MODEL", "").strip()
+        if not model:
+            model = default.model if same_provider else os.getenv(
+                "ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022"
+            ).strip()
+        base_url_key = f"{prefix}BASE_URL"
+        if base_url_key in os.environ:
+            base_url = os.getenv(base_url_key, "").strip() or None
+        else:
+            base_url = default.base_url if same_provider else os.getenv(
+                "ANTHROPIC_BASE_URL", ""
+            ).strip() or None
+        if not api_key:
+            raise RuntimeError(f"{prefix}PROVIDER=anthropic，但未设置可用的 API Key")
+        return LLMConfig(
+            provider="anthropic",
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            api_style="messages",
+        )
+
+    api_key = os.getenv(f"{prefix}API_KEY", "").strip()
+    if not api_key:
+        api_key = default.api_key if same_provider else os.getenv("OPENAI_API_KEY", "").strip()
+    model = os.getenv(f"{prefix}MODEL", "").strip()
+    if not model:
+        model = default.model if same_provider else os.getenv("OPENAI_MODEL", "").strip()
+    base_url_key = f"{prefix}BASE_URL"
+    if base_url_key in os.environ:
+        base_url = os.getenv(base_url_key, "").strip() or None
+    else:
+        base_url = default.base_url if same_provider else os.getenv(
+            "OPENAI_BASE_URL", ""
+        ).strip() or None
+    api_style = os.getenv(f"{prefix}API_STYLE", "").strip().lower()
+    if not api_style:
+        api_style = default.api_style if same_provider else os.getenv(
+            "OPENAI_API_STYLE", "responses"
+        ).strip().lower()
+    if not api_key:
+        raise RuntimeError(f"{prefix}PROVIDER=openai，但未设置可用的 API Key")
+    if not model:
+        raise RuntimeError(f"{prefix}PROVIDER=openai，但未设置可用的模型名称")
+    if api_style not in _SUPPORTED_OPENAI_STYLES:
+        raise RuntimeError(
+            f"{prefix}API_STYLE 仅支持 responses 或 chat_completions"
+        )
+    return LLMConfig(
+        provider="openai",
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        api_style=api_style,
+    )
+
+
+def build_component_llm_runtimes(
+    components: Iterable[str],
+    default_config: LLMConfig,
+    default_client: Any,
+) -> Dict[str, LLMRuntime]:
+    """Create component runtimes while reusing clients for identical configs."""
+
+    clients: Dict[LLMConfig, Any] = {default_config: default_client}
+    runtimes: Dict[str, LLMRuntime] = {}
+    for component in components:
+        config = load_component_llm_config(component, default_config)
+        client = clients.get(config)
+        if client is None:
+            client = create_llm_client(config)
+            clients[config] = client
+        runtimes[component] = LLMRuntime(config=config, client=client)
+    return runtimes
 
 
 def _text_response(text: str) -> Any:

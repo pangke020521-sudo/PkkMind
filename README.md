@@ -86,6 +86,27 @@ OPENAI_API_STYLE=chat_completions
 
 本次兼容仅涉及文本模型调用。Embedding 的远端模型选择逻辑保持不变，未配置或客户端不支持时仍按原逻辑使用本地 n-gram。
 
+General、Technical、Billing Agent 默认继承上述全局配置。需要时可用
+`PKKMIND_{AGENT}_LLM_*` 为单个 Agent 覆盖 provider、model、API Key、
+base URL 和 OpenAI API style。例如，全局使用 OpenAI、技术 Agent 使用
+Anthropic：
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY=your_openai_key
+OPENAI_MODEL=gpt-5-mini
+
+PKKMIND_TECHNICAL_LLM_PROVIDER=anthropic
+PKKMIND_TECHNICAL_LLM_API_KEY=your_anthropic_key
+PKKMIND_TECHNICAL_LLM_MODEL=claude-3-5-sonnet-20241022
+```
+
+只设置 `PKKMIND_GENERAL_LLM_MODEL` 时，General Agent 会继承全局 provider、
+API Key、base URL 和 API style，仅覆盖模型名。服务启动日志和 `/health`
+的 Agent 统计会显示每个 Agent 实际使用的 provider 与 model。当前独立配置
+适用于普通文本调用；Anthropic/OpenAI 工具调用格式的统一适配将在 Tool Use
+能力接入时补充。
+
 Docker Compose 场景下，Redis 和 ChromaDB 的连接由 `docker-compose.yml` 覆盖为容器内地址。通常不需要手动改：
 
 ```env

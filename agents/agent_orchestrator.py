@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.llm_client import LLMRuntime
 from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
@@ -127,9 +128,16 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
 
-    def __init__(self, client: Any, model: str, skill_manager: Optional[Any] = None):
+    def __init__(
+        self,
+        client: Any,
+        model: str,
+        skill_manager: Optional[Any] = None,
+        provider: str = "unknown",
+    ):
         self._client = client
         self._model  = model
+        self._provider = provider
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
 
@@ -255,6 +263,8 @@ class AgentOrchestrator:
         model:    str = "claude-3-5-sonnet-20241022",
         embedding_enabled: bool = True,
         skill_manager: Optional[Any] = None,
+        provider: str = "unknown",
+        agent_llms: Optional[Dict[AgentType, LLMRuntime]] = None,
     ):
         self._intent_recognizer = IntentRecognizer(
             client=client,
@@ -262,13 +272,44 @@ class AgentOrchestrator:
             embedding_enabled=embedding_enabled,
         )
         self._skill_manager = skill_manager
+        self._agent_llms = dict(agent_llms or {})
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
-            AgentType.GENERAL:   [GeneralAgent(client, model, skill_manager)],
-            AgentType.TECHNICAL: [TechnicalAgent(client, model, skill_manager)],
-            AgentType.BILLING:   [BillingAgent(client, model, skill_manager)],
+            AgentType.GENERAL: [self._make_agent(
+                GeneralAgent, AgentType.GENERAL, client, model, provider, skill_manager
+            )],
+            AgentType.TECHNICAL: [self._make_agent(
+                TechnicalAgent, AgentType.TECHNICAL, client, model, provider, skill_manager
+            )],
+            AgentType.BILLING: [self._make_agent(
+                BillingAgent, AgentType.BILLING, client, model, provider, skill_manager
+            )],
         }
+
+    def _make_agent(
+        self,
+        agent_cls: type[BaseAgent],
+        agent_type: AgentType,
+        default_client: Any,
+        default_model: str,
+        default_provider: str,
+        skill_manager: Optional[Any],
+    ) -> BaseAgent:
+        runtime = self._agent_llms.get(agent_type)
+        if runtime is None:
+            return agent_cls(
+                default_client,
+                default_model,
+                skill_manager,
+                provider=default_provider,
+            )
+        return agent_cls(
+            runtime.client,
+            runtime.config.model,
+            skill_manager,
+            provider=runtime.config.provider,
+        )
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
         """更新 SkillManager 引用，供运行时重载或测试替换使用。"""
@@ -622,6 +663,8 @@ class AgentOrchestrator:
                     "avg_ms":       round(agent.stats.avg_ms, 1),
                     "monitor_penalty": round(agent.stats.monitor_penalty, 3),
                     "routing_score": round(agent.stats.routing_score(), 3),
+                    "provider": agent._provider,
+                    "model": agent._model,
                 }
         return result
 
