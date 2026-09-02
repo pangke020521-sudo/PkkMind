@@ -372,12 +372,25 @@ class IntentRecognizer:
     def _extract_entities(self, message: str) -> Dict[str, List[str]]:
         """用规则提取高价值实体，避免每次识别都额外调用 LLM。"""
         message = self._clean_text(message)
+        labeled_error_codes = re.findall(
+            r"(?:错误码|错误代码|error(?:\s+code)?|code)\s*[:：#-]?\s*([A-Z0-9][A-Z0-9_-]{2,20})",
+            message,
+            re.I,
+        )
+        http_error_codes = re.findall(r"(?<![A-Za-z0-9])([45]\d{2})(?!\d)", message)
+        symbolic_error_codes = re.findall(
+            r"(?<![A-Za-z0-9_-])((?:ERR(?:OR)?|E)[_-]?[A-Z0-9]{2,16})(?![A-Za-z0-9_-])",
+            message,
+            re.I,
+        )
         return {
             "order_id": self._unique(re.findall(r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})", message, re.I)),
             "product": [],
             "date": self._unique(re.findall(r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", message)),
             "amount": self._unique(re.findall(r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))", message, re.I)),
-            "error_code": self._unique(re.findall(r"\b([45]\d{2}|[A-Z][A-Z0-9_-]{2,16})\b", message)),
+            "error_code": self._unique(
+                labeled_error_codes + http_error_codes + symbolic_error_codes
+            ),
         }
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────

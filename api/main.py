@@ -83,6 +83,7 @@ async def lifespan(app: FastAPI):
     from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
     from core.intent_recognizer import IntentRecognizer
     from evaluation.evaluator import EndToEndEvaluator
+    from mcp.domain_tools import create_domain_tools
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
     from memory.conversation_memory import MemoryManager
@@ -190,7 +191,11 @@ async def lifespan(app: FastAPI):
         cache_ttl=300.0,
         supports_rerank=True,
         fallback=knowledge_fallback,
+        allowed_callers=("system", "general", "technical", "billing"),
     ))
+    for domain_tool in create_domain_tools():
+        _tool_manager.register(domain_tool)
+    _orchestrator.set_tool_manager(_tool_manager)
 
     # 性能监控（可选启动 Prometheus）
     prom_port = int(os.getenv("PROMETHEUS_PORT", "0")) or None
@@ -245,6 +250,7 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
+    request_id:  str
     conv_id:     str
     response:    str
     intent:      str
@@ -268,7 +274,11 @@ class ChatResponse(BaseModel):
 async def health():
     if _orchestrator is None:
         raise HTTPException(503, "服务未就绪")
-    return {"status": "ok", "agents": _orchestrator.get_stats()}
+    return {
+        "status": "ok",
+        "agents": _orchestrator.get_stats(),
+        "tools": _tool_manager.get_stats() if _tool_manager else {},
+    }
 
 
 @app.get("/skills", tags=["Skills"])
@@ -303,6 +313,7 @@ async def chat(req: ChatRequest):
     from memory.conversation_memory import MsgRole
 
     conv_id = req.conv_id or str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
 
     # 1. 读取记忆上下文
     mem_ctx = await _memory.get_context(req.user_id, conv_id, query=req.message)
@@ -314,7 +325,13 @@ async def chat(req: ChatRequest):
     ] if mem_ctx.recent_messages else None
 
     intent_result = await _orchestrator.recognize_intent(req.message, history=history)
-    knowledge_text, knowledge_used = await _build_knowledge_context(req.message, intent=intent_result.intent)
+    knowledge_text, knowledge_used = await _build_knowledge_context(
+        req.message,
+        intent=intent_result.intent,
+        request_id=request_id,
+        user_id=req.user_id,
+        conv_id=conv_id,
+    )
     context_parts = [mem_ctx.to_prompt_text()]
     if knowledge_text:
         context_parts.append(knowledge_text)
@@ -331,6 +348,7 @@ async def chat(req: ChatRequest):
         intent_group=intent_result.intent_group,
         urgency=intent_result.urgency,
         intent_confidence=intent_result.confidence,
+        request_id=request_id,
     )
 
     # 3. 执行
@@ -344,6 +362,7 @@ async def chat(req: ChatRequest):
     asyncio.create_task(_memory.update_profile(req.user_id, conv_id))
 
     return ChatResponse(
+        request_id=result.request_id,
         conv_id=conv_id,
         response=result.response,
         intent=result.intent.value if result.intent else "other",
@@ -363,7 +382,14 @@ async def chat(req: ChatRequest):
     )
 
 
-async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) -> tuple[str, bool]:
+async def _build_knowledge_context(
+    message: str,
+    intent=None,
+    top_k: int = 3,
+    request_id: str = "",
+    user_id: str = "",
+    conv_id: str = "",
+) -> tuple[str, bool]:
     """
     为 /chat 主链路构建 RAG 知识上下文。
 
@@ -374,7 +400,19 @@ async def _build_knowledge_context(message: str, intent=None, top_k: int = 3) ->
     if not _should_use_knowledge(message, intent=intent):
         return "", False
     try:
-        result = await _tool_manager.search_with_rewrite("knowledge_search", message, top_k=top_k)
+        from mcp.tool_manager import ToolCallContext
+
+        result = await _tool_manager.search_with_rewrite(
+            "knowledge_search",
+            message,
+            ToolCallContext(
+                request_id=request_id or str(uuid.uuid4()),
+                caller="system",
+                user_id=user_id,
+                conv_id=conv_id,
+            ),
+            top_k=top_k,
+        )
         if not result.success or not isinstance(result.data, list) or not result.data:
             return "", False
 
@@ -447,8 +485,21 @@ async def search(query: str, top_k: int = 5):
     """
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
-    result = await _tool_manager.search_with_rewrite("knowledge_search", query, top_k=top_k)
-    return {"query": query, "results": result.data, "reranked": result.reranked}
+    from mcp.tool_manager import ToolCallContext
+
+    request_id = str(uuid.uuid4())
+    result = await _tool_manager.search_with_rewrite(
+        "knowledge_search",
+        query,
+        ToolCallContext(request_id=request_id, caller="system"),
+        top_k=top_k,
+    )
+    return {
+        "request_id": request_id,
+        "query": query,
+        "results": result.data,
+        "reranked": result.reranked,
+    }
 
 
 class DocInput(BaseModel):

@@ -44,6 +44,17 @@ class ToolResult:
     cached:         bool = False
     latency_ms:     float = 0.0
     reranked:       bool = False   # 是否经过重排
+    denied:         bool = False   # 是否被调用权限网关拒绝
+
+
+@dataclass(frozen=True)
+class ToolCallContext:
+    """一次工具调用的可信调用者上下文，由 PkkMind 代码构造而非模型提供。"""
+
+    request_id: str
+    caller: str
+    user_id: str = ""
+    conv_id: str = ""
 
 
 @dataclass
@@ -52,6 +63,7 @@ class ToolStats:
     total:              int = 0
     success:            int = 0
     failed:             int = 0
+    denied:             int = 0
     total_latency_ms:   float = 0.0
     consecutive_fails:  int = 0
 
@@ -116,6 +128,7 @@ class Tool:
     timeout_s:   float = 30.0
     supports_rerank: bool = False            # 是否支持结果重排
     fallback:    Optional[Callable] = None    # sync/async (params, context, error) -> Any
+    allowed_callers: Tuple[str, ...] = ()     # 空元组表示默认拒绝所有调用者
 
     # 运行时状态（不参与构造）
     stats:   ToolStats    = field(default_factory=ToolStats, init=False)
@@ -153,6 +166,7 @@ class MCPToolManager:
         self,
         name: str,
         params: Dict[str, Any],
+        call_context: ToolCallContext,
         context: Optional[Dict[str, Any]] = None,
         *,
         use_cache: bool = True,
@@ -165,6 +179,22 @@ class MCPToolManager:
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+
+        if call_context.caller not in tool.allowed_callers:
+            tool.stats.denied += 1
+            logger.warning(
+                "工具调用被拒绝: request_id=%s caller=%s tool=%s",
+                call_context.request_id,
+                call_context.caller,
+                name,
+            )
+            return ToolResult(
+                success=False,
+                data=None,
+                tool_name=name,
+                error=f"调用者 {call_context.caller} 无权使用工具 {name}",
+                denied=True,
+            )
 
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
 
@@ -308,6 +338,7 @@ class MCPToolManager:
         self,
         tool_name: str,
         query: str,
+        call_context: ToolCallContext,
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
@@ -316,6 +347,30 @@ class MCPToolManager:
 
         这是解决"检索不全、召回不好"的完整方案。
         """
+        tool = self._tools.get(tool_name)
+        if not tool:
+            return ToolResult(
+                success=False,
+                data=None,
+                tool_name=tool_name,
+                error=f"工具不存在: {tool_name}",
+            )
+        if call_context.caller not in tool.allowed_callers:
+            tool.stats.denied += 1
+            logger.warning(
+                "检索工具调用被拒绝: request_id=%s caller=%s tool=%s",
+                call_context.request_id,
+                call_context.caller,
+                tool_name,
+            )
+            return ToolResult(
+                success=False,
+                data=None,
+                tool_name=tool_name,
+                error=f"调用者 {call_context.caller} 无权使用工具 {tool_name}",
+                denied=True,
+            )
+
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
@@ -323,7 +378,13 @@ class MCPToolManager:
         # 2. 并行召回：所有子查询同时检索
         recall_k = max(top_k, 5)
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
+            self.call(
+                tool_name,
+                {"query": q, "top_k": recall_k},
+                call_context,
+                context,
+                use_cache=True,
+            )
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -455,6 +516,8 @@ class MCPToolManager:
                 "avg_latency_ms": round(t.stats.avg_latency_ms, 1),
                 "consecutive_fails": t.stats.consecutive_fails,
                 "circuit_state": t.breaker.state.value,
+                "denied": t.stats.denied,
+                "allowed_callers": list(t.allowed_callers),
             }
             for name, t in self._tools.items()
         }

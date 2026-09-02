@@ -506,6 +506,7 @@ curl -X POST http://localhost:8000/chat \
 
 ```json
 {
+  "request_id": "550e8400-e29b-41d4-a716-446655440000",
   "conv_id": "session_001",
   "response": "请提供订单号，我可以帮您查询订单状态和物流进度。",
   "intent": "query",
@@ -522,6 +523,7 @@ curl -X POST http://localhost:8000/chat \
 | `message` | 用户输入 |
 | `user_id` | 用户唯一标识，用于隔离记忆和用户画像 |
 | `conv_id` | 会话 ID，相同 `conv_id` 表示同一轮多轮对话 |
+| `request_id` | 单次请求 ID，由后端生成；同一会话的每轮请求都不同 |
 | `intent` | 识别出的意图 |
 | `agent_type` | 实际处理请求的 Agent |
 | `escalated` | 是否触发逻辑升级；当前不代表已经接入或通知正式人工客服 |
@@ -598,8 +600,9 @@ General、Technical、Billing Agent 除了使用不同的 system prompt，还分
 | `billing` | 账单核验、退款/发票路径说明 | `0.0` | `1100` |
 
 访问 `/health` 可以查看每个 Agent 实际使用的 provider、model、角色、工作流、
-输入输出契约及生成参数。`tool_scope` 当前是角色能力边界声明，真正的 Agent Tool
-Use 和运行时工具白名单尚未接入。
+输入输出契约及生成参数。`tool_scope` 对应当前 Agent 获准使用的工具；权限由运行时
+白名单强制检查。模型自主选择工具的原生 Tool Calling 尚未接入，目前由编排器
+确定性触发领域工具。
 
 ### 6.7 人工升级 Agent
 
@@ -612,6 +615,28 @@ Use 和运行时工具白名单尚未接入。
 > `escalated=true` 只表示系统在逻辑上判定该请求需要人工处理，并生成了交接信息；
 > 不代表已经创建真实工单，也不会自动通知人工客服。正式上线前需要在该节点接入
 > 企业客服平台或工单服务，并记录真实的工单编号和流转状态。
+
+### 6.8 Agent 工具权限隔离
+
+工具权限由 `MCPToolManager` 在运行时强制检查，不依赖模型遵守 Prompt。每次调用
+必须携带由后端创建的 `ToolCallContext`，其中包含 `request_id`、调用者、用户和
+会话信息；调用者不在工具的 `allowed_callers` 白名单中时，请求会在缓存、熔断器、
+fallback 和工具 handler 之前被拒绝。
+
+| 工具 | 允许调用者 | 当前行为 |
+|------|------------|----------|
+| `knowledge_search` | `system`、`general`、`technical`、`billing` | ChromaDB 知识检索 |
+| `error_code_lookup` | `technical` | 查询本地常见 HTTP 错误码目录 |
+| `billing_field_check` | `billing` | 检查账单核验字段，不访问或修改真实账单 |
+
+领域工具目前由编排器根据 Agent 类型和已提取实体确定性调用，再把结果注入对应
+Agent 的上下文。多 Agent 并行时，每个 Agent 使用独立的请求副本，工具结果不会
+串到其他 Agent。当前尚未接入 OpenAI/Anthropic 原生 Tool Calling；即使后续接入，
+模型提出的调用仍必须通过同一权限网关。
+
+`/chat` 响应中的 `request_id` 每次请求都会重新生成，同一 `conv_id` 下的不同轮次
+也拥有不同的 `request_id`。`/health` 的 `tools` 字段会展示工具成功率、拒绝次数和
+允许调用者，便于检查实际权限配置。
 
 ## 7. 知识库使用
 

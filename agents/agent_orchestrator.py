@@ -20,13 +20,14 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_client import LLMRuntime
 from core.llm_utils import extract_text_content
+from mcp.tool_manager import MCPToolManager, ToolCallContext, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ class Request:
     intent_group: Optional[str] = None
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
-    request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    request_id:  str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
 @dataclass
@@ -262,7 +263,7 @@ class GeneralAgent(BaseAgent):
         input_contract=("对话历史", "用户画像", "意图与紧急度", "知识库上下文"),
         output_contract=("先回应核心问题", "信息不足时只询问必要字段", "明确下一步和能力边界"),
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
-        tool_scope=("knowledge_search", "request_context", "required_fields"),
+        tool_scope=("knowledge_search",),
         temperature=0.3,
         max_tokens=900,
     )
@@ -287,7 +288,7 @@ class TechnicalAgent(BaseAgent):
         input_contract=("错误码", "问题发生时间", "运行环境", "影响范围", "最近变更", "知识库上下文"),
         output_contract=("现象复述", "可能原因", "编号排查步骤", "验证方法", "需要补充的信息"),
         handoff_conditions=("生产环境大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
-        tool_scope=("knowledge_search", "error_code_lookup", "diagnostic_plan"),
+        tool_scope=("knowledge_search", "error_code_lookup"),
         temperature=0.1,
         max_tokens=1200,
     )
@@ -315,7 +316,7 @@ class BillingAgent(BaseAgent):
         input_contract=("订单号", "金额与币种", "支付时间", "支付渠道", "用户期望", "知识库上下文"),
         output_contract=("需要核验的信息", "当前可判断内容", "下一步处理路径", "时效与权限边界"),
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
-        tool_scope=("knowledge_search", "billing_field_check", "amount_comparison"),
+        tool_scope=("knowledge_search", "billing_field_check"),
         temperature=0.0,
         max_tokens=1100,
     )
@@ -436,6 +437,7 @@ class AgentOrchestrator:
         skill_manager: Optional[Any] = None,
         provider: str = "unknown",
         agent_llms: Optional[Dict[AgentType, LLMRuntime]] = None,
+        tool_manager: Optional[MCPToolManager] = None,
     ):
         self._intent_recognizer = IntentRecognizer(
             client=client,
@@ -444,6 +446,7 @@ class AgentOrchestrator:
         )
         self._skill_manager = skill_manager
         self._agent_llms = dict(agent_llms or {})
+        self._tool_manager = tool_manager
 
         # Agent 池：每种类型可有多个实例（水平扩展）
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -494,6 +497,10 @@ class AgentOrchestrator:
         for agents in self._pool.values():
             for agent in agents:
                 agent._skill_manager = skill_manager
+
+    def set_tool_manager(self, tool_manager: Optional[MCPToolManager]) -> None:
+        """注入工具管理器；权限判断始终由 MCPToolManager 执行。"""
+        self._tool_manager = tool_manager
 
     async def recognize_intent(
         self,
@@ -816,16 +823,67 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        agent_req = await self._with_domain_tool_context(req, agent.agent_type)
+        response = await agent.handle(agent_req)
 
         # 专属 Agent 失败时降级到 GeneralAgent
         if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                response = await fallback.handle(req)
+                fallback_req = await self._with_domain_tool_context(req, AgentType.GENERAL)
+                response = await fallback.handle(fallback_req)
 
         return response
+
+    async def _with_domain_tool_context(self, req: Request, agent_type: AgentType) -> Request:
+        """确定性调用当前 Agent 获准的领域工具，并返回隔离的 Request 副本。"""
+        if self._tool_manager is None:
+            return replace(req)
+
+        calls: List[tuple[str, Dict[str, Any]]] = []
+        if agent_type == AgentType.TECHNICAL:
+            error_codes = req.entities.get("error_code", [])
+            if error_codes:
+                calls.append(("error_code_lookup", {"error_code": error_codes[0]}))
+        elif agent_type == AgentType.BILLING:
+            calls.append(("billing_field_check", {"entities": req.entities}))
+
+        if not calls:
+            return replace(req)
+
+        call_context = ToolCallContext(
+            request_id=req.request_id,
+            caller=agent_type.value,
+            user_id=req.user_id,
+            conv_id=req.conv_id,
+        )
+        tool_results: List[str] = []
+        for tool_name, params in calls:
+            result: ToolResult = await self._tool_manager.call(
+                tool_name,
+                params,
+                call_context,
+                context={"intent": req.intent.value if req.intent else None},
+            )
+            if result.success:
+                tool_results.append(
+                    f"- {tool_name}: {json.dumps(result.data, ensure_ascii=False)}"
+                )
+            else:
+                logger.warning(
+                    "领域工具未产生结果: request_id=%s agent=%s tool=%s error=%s",
+                    req.request_id,
+                    agent_type.value,
+                    tool_name,
+                    result.error,
+                )
+
+        if not tool_results:
+            return replace(req)
+
+        parts = [part for part in (req.context, "[确定性工具结果]\n" + "\n".join(tool_results)) if part]
+        return replace(req, context="\n\n".join(parts))
 
     # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 
