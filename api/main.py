@@ -86,6 +86,7 @@ async def lifespan(app: FastAPI):
     from mcp.domain_tools import create_domain_tools
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
+    from mcp.tool_trace import RedisToolTraceStore
     from memory.conversation_memory import MemoryManager
     from monitor.performance_monitor import PerformanceMonitor
     from core.skill_loader import SkillManager
@@ -144,9 +145,11 @@ async def lifespan(app: FastAPI):
         agent_llms=agent_llms,
     )
 
+    redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
     # 记忆管理器（Redis 工作记忆 + ChromaDB 情景记忆/用户画像）
     _memory = MemoryManager(
-        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
+        redis_url=redis_url,
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
         chroma_port=int(os.getenv("CHROMA_PORT", "8000")),
         chroma_path=os.getenv("CHROMA_PERSIST_DIRECTORY", "/app/data/chroma"),
@@ -158,6 +161,11 @@ async def lifespan(app: FastAPI):
     _tool_manager = MCPToolManager(
         client=client,
         model=cfg.model,
+        trace_store=RedisToolTraceStore(
+            redis_url,
+            ttl_s=int(os.getenv("PKKMIND_TOOL_TRACE_TTL_S", "86400")),
+            recent_limit=int(os.getenv("PKKMIND_TOOL_TRACE_RECENT_LIMIT", "1000")),
+        ),
     )
     kb = KnowledgeBase(
         chroma_host=os.getenv("CHROMA_HOST", "chromadb"),
@@ -221,6 +229,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await _monitor.stop()
+    if _tool_manager is not None:
+        await _tool_manager.close()
     if _memory is not None:
         await _memory.close()
     logger.info("PkkMind 已关闭")
@@ -267,6 +277,7 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    tools_used: List[str] = Field(default_factory=list)
 
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
@@ -353,6 +364,15 @@ async def chat(req: ChatRequest):
 
     # 3. 执行
     result = await _orchestrator.run(orch_req)
+    request_trace = (
+        await _tool_manager.get_request_trace(result.request_id)
+        if _tool_manager is not None else []
+    )
+    tools_used = list(dict.fromkeys(
+        item.get("tool_name", "")
+        for item in request_trace
+        if item.get("success") and item.get("tool_name")
+    ))
 
     # 4. 写入记忆
     await _memory.add_message(req.user_id, conv_id, MsgRole.USER, req.message)
@@ -379,7 +399,38 @@ async def chat(req: ChatRequest):
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
+        tools_used=tools_used,
     )
+
+
+@app.get("/trace/tool/{request_id}", tags=["Trace"])
+async def tool_trace_by_request(request_id: str):
+    """查看一次后端生成 request_id 下的脱敏工具调用轨迹。"""
+    if _tool_manager is None:
+        raise HTTPException(503, "服务未就绪")
+    try:
+        normalized = str(uuid.UUID(request_id))
+    except ValueError as ex:
+        raise HTTPException(400, "request_id 必须是有效 UUID") from ex
+    traces = await _tool_manager.get_request_trace(normalized)
+    return {
+        "request_id": normalized,
+        "tools_used": list(dict.fromkeys(
+            item.get("tool_name", "")
+            for item in traces
+            if item.get("success") and item.get("tool_name")
+        )),
+        "traces": traces,
+    }
+
+
+@app.get("/trace/tools", tags=["Trace"])
+async def recent_tool_traces(limit: int = 20):
+    """查看最近的脱敏工具调用轨迹，limit 范围由存储层限制为 1-100。"""
+    if _tool_manager is None:
+        raise HTTPException(503, "服务未就绪")
+    traces = await _tool_manager.get_recent_traces(limit)
+    return {"limit": max(1, min(limit, 100)), "traces": traces}
 
 
 async def _build_knowledge_context(

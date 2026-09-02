@@ -511,6 +511,7 @@ curl -X POST http://localhost:8000/chat \
   "response": "请提供订单号，我可以帮您查询订单状态和物流进度。",
   "intent": "query",
   "agent_type": "general",
+  "tools_used": ["knowledge_search"],
   "escalated": false,
   "latency_ms": 1234.5
 }
@@ -526,6 +527,7 @@ curl -X POST http://localhost:8000/chat \
 | `request_id` | 单次请求 ID，由后端生成；同一会话的每轮请求都不同 |
 | `intent` | 识别出的意图 |
 | `agent_type` | 实际处理请求的 Agent |
+| `tools_used` | 本次请求中成功执行过的工具名，自动去重 |
 | `escalated` | 是否触发逻辑升级；当前不代表已经接入或通知正式人工客服 |
 | `latency_ms` | 端到端延迟 |
 
@@ -601,8 +603,9 @@ General、Technical、Billing Agent 除了使用不同的 system prompt，还分
 
 访问 `/health` 可以查看每个 Agent 实际使用的 provider、model、角色、工作流、
 输入输出契约及生成参数。`tool_scope` 对应当前 Agent 获准使用的工具；权限由运行时
-白名单强制检查。模型自主选择工具的原生 Tool Calling 尚未接入，目前由编排器
-确定性触发领域工具。
+白名单强制检查。OpenAI Responses、OpenAI-compatible Chat Completions 和
+Anthropic Messages 的结构化工具调用会统一转换为内部 `UnifiedToolCall`，再由
+PkkMind 执行本地工具；提供方不执行 PkkMind 的业务代码。
 
 ### 6.7 人工升级 Agent
 
@@ -629,14 +632,32 @@ fallback 和工具 handler 之前被拒绝。
 | `error_code_lookup` | `technical` | 查询本地常见 HTTP 错误码目录 |
 | `billing_field_check` | `billing` | 检查账单核验字段，不访问或修改真实账单 |
 
-领域工具目前由编排器根据 Agent 类型和已提取实体确定性调用，再把结果注入对应
-Agent 的上下文。多 Agent 并行时，每个 Agent 使用独立的请求副本，工具结果不会
-串到其他 Agent。当前尚未接入 OpenAI/Anthropic 原生 Tool Calling；即使后续接入，
-模型提出的调用仍必须通过同一权限网关。
+Agent 只会收到自身白名单内的工具定义。模型产生的 OpenAI `tool_calls`、Responses
+`function_call` 或 Anthropic `tool_use` 会统一为 `UnifiedToolCall`，通过权限网关后
+执行，并将结果按对应提供方协议交还模型。对于不支持或拒绝 Tool Calling 的兼容
+模型，错误码和账单字段工具会使用确定性调用回退；两条路径都经过相同权限检查。
 
 `/chat` 响应中的 `request_id` 每次请求都会重新生成，同一 `conv_id` 下的不同轮次
 也拥有不同的 `request_id`。`/health` 的 `tools` 字段会展示工具成功率、拒绝次数和
 允许调用者，便于检查实际权限配置。
+
+### 6.9 request_id 工具轨迹
+
+每次工具调用都会按后端生成的 `request_id` 写入 Redis，默认保留 24 小时。轨迹
+包含调用者、脱敏参数、成功/拒绝状态、缓存命中、重排、耗时和错误。`password`、
+`token`、`secret`、`api_key`、`authorization`、`cookie` 等敏感字段在写入前会替换为
+`[REDACTED]`。
+
+```bash
+# 查询一次请求的全部工具轨迹
+curl http://localhost:8000/trace/tool/550e8400-e29b-41d4-a716-446655440000
+
+# 查询最近工具轨迹，limit 会限制在 1-100
+curl "http://localhost:8000/trace/tools?limit=20"
+```
+
+Trace 接口用于开发和运维诊断。生产环境对外开放前应在 Nginx 或 API 层增加管理员
+认证，不应把跨用户诊断数据直接暴露给普通终端用户。
 
 ## 7. 知识库使用
 

@@ -23,6 +23,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.llm_utils import extract_text_content
+from mcp.tool_trace import RedisToolTraceStore
 
 logger = logging.getLogger(__name__)
 
@@ -145,9 +146,15 @@ class MCPToolManager:
       用户查询 → 查询改写（多角度子查询）→ 并行召回 → 结果重排 → 返回 Top-K
     """
 
-    def __init__(self, client: Any, model: str = "claude-3-5-sonnet-20241022"):
+    def __init__(
+        self,
+        client: Any,
+        model: str = "claude-3-5-sonnet-20241022",
+        trace_store: Optional[RedisToolTraceStore] = None,
+    ):
         self._client = client
         self._model  = model
+        self._trace_store = trace_store
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}   # key → (result, expire_at, reranked)
 
@@ -178,7 +185,11 @@ class MCPToolManager:
         """
         tool = self._tools.get(name)
         if not tool:
-            return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
+            return await self._trace_and_return(
+                call_context,
+                params,
+                ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}"),
+            )
 
         if call_context.caller not in tool.allowed_callers:
             tool.stats.denied += 1
@@ -188,12 +199,16 @@ class MCPToolManager:
                 call_context.caller,
                 name,
             )
-            return ToolResult(
-                success=False,
-                data=None,
-                tool_name=name,
-                error=f"调用者 {call_context.caller} 无权使用工具 {name}",
-                denied=True,
+            return await self._trace_and_return(
+                call_context,
+                params,
+                ToolResult(
+                    success=False,
+                    data=None,
+                    tool_name=name,
+                    error=f"调用者 {call_context.caller} 无权使用工具 {name}",
+                    denied=True,
+                ),
             )
 
         cache_rerank_top_k = rerank_top_k if rerank_top_k > 0 and tool.supports_rerank else 0
@@ -205,18 +220,23 @@ class MCPToolManager:
                 cached_data, cached_reranked = cached
                 tool.stats.total += 1
                 tool.stats.success += 1
-                return ToolResult(
-                    success=True,
-                    data=cached_data,
-                    tool_name=name,
-                    cached=True,
-                    reranked=cached_reranked,
+                return await self._trace_and_return(
+                    call_context,
+                    params,
+                    ToolResult(
+                        success=True,
+                        data=cached_data,
+                        tool_name=name,
+                        cached=True,
+                        reranked=cached_reranked,
+                    ),
                 )
 
         # 熔断检查
         if not tool.breaker.allow():
             error = f"工具熔断中: {name}，请稍后重试"
-            return await self._fallback_result(tool, params, context, error)
+            result = await self._fallback_result(tool, params, context, error)
+            return await self._trace_and_return(call_context, params, result)
 
         t0 = time.monotonic()
         tool.stats.total += 1
@@ -242,22 +262,67 @@ class MCPToolManager:
             if tool.cache_ttl > 0:
                 self._set_cache(name, params, data, tool.cache_ttl, cache_rerank_top_k, reranked)
 
-            return ToolResult(success=True, data=data, tool_name=name,
-                              latency_ms=latency, reranked=reranked)
+            return await self._trace_and_return(
+                call_context,
+                params,
+                ToolResult(
+                    success=True,
+                    data=data,
+                    tool_name=name,
+                    latency_ms=latency,
+                    reranked=reranked,
+                ),
+            )
 
         except asyncio.TimeoutError:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
             logger.error(f"工具超时: {name} ({tool.timeout_s}s)")
-            return await self._fallback_result(tool, params, context, "执行超时")
+            result = await self._fallback_result(tool, params, context, "执行超时")
+            result.latency_ms = (time.monotonic() - t0) * 1000
+            return await self._trace_and_return(call_context, params, result)
 
         except Exception as ex:
             tool.stats.failed += 1
             tool.stats.consecutive_fails += 1
             tool.breaker.record_failure()
             logger.error(f"工具异常: {name} — {ex}")
-            return await self._fallback_result(tool, params, context, str(ex))
+            result = await self._fallback_result(tool, params, context, str(ex))
+            result.latency_ms = (time.monotonic() - t0) * 1000
+            return await self._trace_and_return(call_context, params, result)
+
+    async def _trace_and_return(
+        self,
+        call_context: ToolCallContext,
+        params: Dict[str, Any],
+        result: ToolResult,
+    ) -> ToolResult:
+        if self._trace_store is None:
+            return result
+        try:
+            await self._trace_store.record(
+                request_id=call_context.request_id,
+                caller=call_context.caller,
+                user_id=call_context.user_id,
+                conv_id=call_context.conv_id,
+                tool_name=result.tool_name,
+                arguments=params,
+                success=result.success,
+                denied=result.denied,
+                cached=result.cached,
+                reranked=result.reranked,
+                latency_ms=result.latency_ms,
+                error=result.error,
+            )
+        except Exception as ex:
+            logger.warning(
+                "工具 Trace 写入失败: request_id=%s tool=%s error=%s",
+                call_context.request_id,
+                result.tool_name,
+                ex,
+            )
+        return result
 
     async def _fallback_result(
         self,
@@ -349,11 +414,15 @@ class MCPToolManager:
         """
         tool = self._tools.get(tool_name)
         if not tool:
-            return ToolResult(
-                success=False,
-                data=None,
-                tool_name=tool_name,
-                error=f"工具不存在: {tool_name}",
+            return await self._trace_and_return(
+                call_context,
+                {"query": query, "top_k": top_k},
+                ToolResult(
+                    success=False,
+                    data=None,
+                    tool_name=tool_name,
+                    error=f"工具不存在: {tool_name}",
+                ),
             )
         if call_context.caller not in tool.allowed_callers:
             tool.stats.denied += 1
@@ -363,13 +432,19 @@ class MCPToolManager:
                 call_context.caller,
                 tool_name,
             )
-            return ToolResult(
-                success=False,
-                data=None,
-                tool_name=tool_name,
-                error=f"调用者 {call_context.caller} 无权使用工具 {tool_name}",
-                denied=True,
+            return await self._trace_and_return(
+                call_context,
+                {"query": query, "top_k": top_k},
+                ToolResult(
+                    success=False,
+                    data=None,
+                    tool_name=tool_name,
+                    error=f"调用者 {call_context.caller} 无权使用工具 {tool_name}",
+                    denied=True,
+                ),
             )
+
+        trace_started = time.monotonic()
 
         # 1. 查询改写：生成多角度子查询
         sub_queries = await self.rewrite_query(query, n=3)
@@ -400,11 +475,34 @@ class MCPToolManager:
                         merged.append(item)
 
         if not merged:
-            return ToolResult(success=False, data=[], tool_name=tool_name, error="所有子查询均无结果")
+            return await self._trace_and_return(
+                call_context,
+                {"query": query, "top_k": top_k, "stage": "search_with_rewrite"},
+                ToolResult(
+                    success=False,
+                    data=[],
+                    tool_name=tool_name,
+                    error="所有子查询均无结果",
+                    latency_ms=(time.monotonic() - trace_started) * 1000,
+                ),
+            )
 
         # 4. 重排：用 LLM 对合并结果按相关性打分，取 Top-K
         reranked = await self._rerank(query, merged, top_k)
-        return ToolResult(success=True, data=reranked, tool_name=tool_name, reranked=True)
+        return await self._trace_and_return(
+            call_context,
+            {"query": query, "top_k": top_k, "stage": "search_with_rewrite"},
+            ToolResult(
+                success=True,
+                data=reranked,
+                tool_name=tool_name,
+                cached=bool(results) and all(
+                    isinstance(item, ToolResult) and item.cached for item in results
+                ),
+                reranked=True,
+                latency_ms=(time.monotonic() - trace_started) * 1000,
+            ),
+        )
 
     # ── 结果重排（解决召回不好）──────────────────────────────────────────────
 
@@ -507,6 +605,32 @@ class MCPToolManager:
         return value.encode("utf-8", errors="ignore").decode("utf-8")
 
     # ── 统计 ──────────────────────────────────────────────────────────────────
+
+    def tool_specs_for(self, caller: str) -> List[Dict[str, Any]]:
+        """Return provider-neutral function specs visible to one trusted caller."""
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.schema,
+            }
+            for tool in self._tools.values()
+            if caller in tool.allowed_callers
+        ]
+
+    async def get_request_trace(self, request_id: str) -> List[Dict[str, Any]]:
+        if self._trace_store is None:
+            return []
+        return await self._trace_store.get_request(request_id)
+
+    async def get_recent_traces(self, limit: int = 20) -> List[Dict[str, Any]]:
+        if self._trace_store is None:
+            return []
+        return await self._trace_store.get_recent(limit)
+
+    async def close(self) -> None:
+        if self._trace_store is not None:
+            await self._trace_store.close()
 
     def get_stats(self) -> Dict[str, Any]:
         return {

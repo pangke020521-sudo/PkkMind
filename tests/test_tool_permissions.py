@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
+from core.llm_client import UnifiedLLMResponse, UnifiedToolCall
 from mcp.domain_tools import create_domain_tools
 from mcp.tool_manager import MCPToolManager, Tool, ToolCallContext
 
@@ -19,6 +20,54 @@ class _FakeClient:
         self.calls.append(kwargs)
         return SimpleNamespace(
             content=[SimpleNamespace(type="text", text=self.text)]
+        )
+
+
+class _NativeToolClient:
+    supports_tool_calling = True
+
+    def __init__(self):
+        self.messages = self
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            return UnifiedLLMResponse(
+                content=[],
+                tool_calls=[UnifiedToolCall(
+                    id="call_1",
+                    name="error_code_lookup",
+                    arguments={"error_code": "401"},
+                )],
+                stop_reason="tool_calls",
+            )
+        return UnifiedLLMResponse(
+            content=[SimpleNamespace(type="text", text="401 表示认证失败")],
+            tool_calls=[],
+            stop_reason="stop",
+        )
+
+
+class _AutoOnlyToolClient(_NativeToolClient):
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise RuntimeError("named tool choice is unsupported")
+        if len(self.calls) == 2:
+            return UnifiedLLMResponse(
+                content=[],
+                tool_calls=[UnifiedToolCall(
+                    id="call_auto",
+                    name="error_code_lookup",
+                    arguments={"error_code": "401"},
+                )],
+                stop_reason="tool_calls",
+            )
+        return UnifiedLLMResponse(
+            content=[SimpleNamespace(type="text", text="auto tool done")],
+            tool_calls=[],
+            stop_reason="stop",
         )
 
 
@@ -251,6 +300,57 @@ class AgentToolContextTests(unittest.TestCase):
         self.assertNotIn("billing_field_check", technical_messages)
         self.assertIn("billing_field_check", billing_messages)
         self.assertNotIn("error_code_lookup", billing_messages)
+
+    def test_native_tool_call_is_executed_through_permission_manager(self):
+        client = _NativeToolClient()
+        manager = MCPToolManager(client, model="test")
+        for tool in create_domain_tools():
+            manager.register(tool)
+        orchestrator = AgentOrchestrator(
+            client=client,
+            model="test-model",
+            embedding_enabled=False,
+            provider="openai",
+            tool_manager=manager,
+        )
+        req = _request(
+            IntentCategory.TECHNICAL_LOGIN,
+            "technical",
+            {"error_code": ["401"]},
+        )
+
+        result = asyncio.run(orchestrator.run(req))
+
+        self.assertEqual(result.response, "401 表示认证失败")
+        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["tool_choice"], "error_code_lookup")
+        self.assertEqual(client.calls[1]["messages"][-1]["role"], "tool")
+        self.assertEqual(manager.get_stats()["error_code_lookup"]["total"], 1)
+
+    def test_named_tool_choice_retries_with_auto_before_deterministic_fallback(self):
+        client = _AutoOnlyToolClient()
+        manager = MCPToolManager(client, model="test")
+        for tool in create_domain_tools():
+            manager.register(tool)
+        orchestrator = AgentOrchestrator(
+            client=client,
+            model="test-model",
+            embedding_enabled=False,
+            provider="openai",
+            tool_manager=manager,
+        )
+
+        result = asyncio.run(orchestrator.run(_request(
+            IntentCategory.TECHNICAL_LOGIN,
+            "technical",
+            {"error_code": ["401"]},
+        )))
+
+        self.assertEqual(result.response, "auto tool done")
+        self.assertEqual(client.calls[0]["tool_choice"], "error_code_lookup")
+        self.assertEqual(client.calls[1]["tool_choice"], "auto")
+        self.assertFalse(client.supports_named_tool_choice)
+        self.assertEqual(manager.get_stats()["error_code_lookup"]["total"], 1)
 
 
 if __name__ == "__main__":

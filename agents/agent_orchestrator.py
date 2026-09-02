@@ -20,7 +20,7 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -158,6 +158,7 @@ class BaseAgent:
         self._provider = provider
         self.profile = profile or self.profile
         self._skill_manager = skill_manager
+        self._tool_manager: Optional[MCPToolManager] = None
         self.stats   = AgentStats()
 
     async def handle(self, req: Request) -> AgentResponse:
@@ -205,14 +206,186 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": "好的，我会按照该角色的输入和输出契约处理。"})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        resp = await self._client.messages.create(
-            model=self._model,
-            max_tokens=self.profile.max_tokens,
-            temperature=self.profile.temperature,
-            system=self._build_system_prompt(req),
-            messages=messages,
+        common_kwargs = {
+            "model": self._model,
+            "max_tokens": self.profile.max_tokens,
+            "temperature": self.profile.temperature,
+            "system": self._build_system_prompt(req),
+        }
+        tool_specs = (
+            self._tool_manager.tool_specs_for(self.agent_type.value)
+            if self._tool_manager is not None else []
         )
+        supports_native_tools = bool(
+            tool_specs and getattr(self._client, "supports_tool_calling", False)
+        )
+
+        if supports_native_tools:
+            try:
+                return await self._call_llm_with_tools(
+                    req,
+                    messages,
+                    tool_specs,
+                    common_kwargs,
+                )
+            except Exception as ex:
+                logger.warning(
+                    "%s 原生 Tool Calling 失败，使用确定性工具回退: %s",
+                    self.agent_type.value,
+                    ex,
+                )
+
+        deterministic_results = await self._run_deterministic_tools(req)
+        if deterministic_results:
+            messages.insert(0, {
+                "role": "user",
+                "content": "[确定性工具结果]\n" + "\n".join(deterministic_results),
+            })
+            messages.insert(1, {
+                "role": "assistant",
+                "content": "好的，我会结合已执行的工具结果回答。",
+            })
+
+        resp = await self._client.messages.create(messages=messages, **common_kwargs)
         return extract_text_content(resp.content)
+
+    async def _call_llm_with_tools(
+        self,
+        req: Request,
+        messages: List[Dict[str, Any]],
+        tool_specs: List[Dict[str, Any]],
+        common_kwargs: Dict[str, Any],
+    ) -> str:
+        """Run at most three provider-neutral tool rounds through the permission gateway."""
+        forced_tool = self._forced_tool_name(req)
+        use_named_choice = bool(
+            forced_tool and getattr(self._client, "supports_named_tool_choice", True)
+        )
+        try:
+            response = await self._client.messages.create(
+                messages=messages,
+                tools=tool_specs,
+                tool_choice=forced_tool if use_named_choice else "auto",
+                **common_kwargs,
+            )
+        except Exception as ex:
+            if not use_named_choice:
+                raise
+            error_text = str(ex).lower().replace(" ", "_")
+            if "tool_choice" in error_text:
+                self._client.supports_named_tool_choice = False
+            logger.info(
+                "%s 模型不接受指定工具，改用 tool_choice=auto 重试",
+                self.agent_type.value,
+            )
+            response = await self._client.messages.create(
+                messages=messages,
+                tools=tool_specs,
+                tool_choice="auto",
+                **common_kwargs,
+            )
+        if forced_tool and not getattr(response, "tool_calls", []):
+            deterministic_results = await self._run_deterministic_tools(req)
+            if deterministic_results:
+                fallback_messages = list(messages)
+                fallback_messages.insert(0, {
+                    "role": "user",
+                    "content": "[确定性工具结果]\n" + "\n".join(deterministic_results),
+                })
+                fallback_messages.insert(1, {
+                    "role": "assistant",
+                    "content": "好的，我会结合已执行的工具结果回答。",
+                })
+                final = await self._client.messages.create(
+                    messages=fallback_messages,
+                    **common_kwargs,
+                )
+                return extract_text_content(final.content)
+
+        for round_index in range(3):
+            tool_calls = list(getattr(response, "tool_calls", []) or [])
+            if not tool_calls:
+                return extract_text_content(response.content)
+
+            messages.append({
+                "role": "assistant",
+                "content": extract_text_content(response.content),
+                "tool_calls": tool_calls,
+                "provider_items": getattr(response, "provider_items", []),
+            })
+            for call in tool_calls:
+                result = await self._execute_model_tool_call(req, call)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "content": json.dumps({
+                        "success": result.success,
+                        "data": result.data,
+                        "error": result.error,
+                        "denied": result.denied,
+                    }, ensure_ascii=False),
+                })
+
+            is_last_round = round_index == 2
+            response = await self._client.messages.create(
+                messages=messages,
+                tools=None if is_last_round else tool_specs,
+                tool_choice="none" if is_last_round else "auto",
+                **common_kwargs,
+            )
+        return extract_text_content(response.content)
+
+    async def _execute_model_tool_call(self, req: Request, call: Any) -> ToolResult:
+        if self._tool_manager is None:
+            return ToolResult(
+                success=False,
+                data=None,
+                tool_name=call.name,
+                error="工具管理器未初始化",
+            )
+        return await self._tool_manager.call(
+            call.name,
+            dict(call.arguments or {}),
+            ToolCallContext(
+                request_id=req.request_id,
+                caller=self.agent_type.value,
+                user_id=req.user_id,
+                conv_id=req.conv_id,
+            ),
+            context={"intent": req.intent.value if req.intent else None},
+        )
+
+    def _forced_tool_name(self, req: Request) -> Optional[str]:
+        if self.agent_type == AgentType.TECHNICAL and req.entities.get("error_code"):
+            return "error_code_lookup"
+        if self.agent_type == AgentType.BILLING:
+            return "billing_field_check"
+        return None
+
+    async def _run_deterministic_tools(self, req: Request) -> List[str]:
+        """Fallback for providers that reject or ignore structured tool calling."""
+        tool_name = self._forced_tool_name(req)
+        if tool_name is None or self._tool_manager is None:
+            return []
+        if tool_name == "error_code_lookup":
+            params = {"error_code": req.entities.get("error_code", [""])[0]}
+        else:
+            params = {"entities": req.entities}
+        result = await self._tool_manager.call(
+            tool_name,
+            params,
+            ToolCallContext(
+                request_id=req.request_id,
+                caller=self.agent_type.value,
+                user_id=req.user_id,
+                conv_id=req.conv_id,
+            ),
+            context={"intent": req.intent.value if req.intent else None},
+        )
+        if not result.success:
+            return []
+        return [f"- {tool_name}: {json.dumps(result.data, ensure_ascii=False)}"]
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约和动态加载的 Skills 拼入 system prompt。"""
@@ -466,6 +639,7 @@ class AgentOrchestrator:
                 provider="none",
             )],
         }
+        self.set_tool_manager(tool_manager)
 
     def _make_agent(
         self,
@@ -501,6 +675,9 @@ class AgentOrchestrator:
     def set_tool_manager(self, tool_manager: Optional[MCPToolManager]) -> None:
         """注入工具管理器；权限判断始终由 MCPToolManager 执行。"""
         self._tool_manager = tool_manager
+        for agents in self._pool.values():
+            for agent in agents:
+                agent._tool_manager = tool_manager
 
     async def recognize_intent(
         self,
@@ -823,67 +1000,16 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        agent_req = await self._with_domain_tool_context(req, agent.agent_type)
-        response = await agent.handle(agent_req)
+        response = await agent.handle(req)
 
         # 专属 Agent 失败时降级到 GeneralAgent
         if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
-                fallback_req = await self._with_domain_tool_context(req, AgentType.GENERAL)
-                response = await fallback.handle(fallback_req)
+                response = await fallback.handle(req)
 
         return response
-
-    async def _with_domain_tool_context(self, req: Request, agent_type: AgentType) -> Request:
-        """确定性调用当前 Agent 获准的领域工具，并返回隔离的 Request 副本。"""
-        if self._tool_manager is None:
-            return replace(req)
-
-        calls: List[tuple[str, Dict[str, Any]]] = []
-        if agent_type == AgentType.TECHNICAL:
-            error_codes = req.entities.get("error_code", [])
-            if error_codes:
-                calls.append(("error_code_lookup", {"error_code": error_codes[0]}))
-        elif agent_type == AgentType.BILLING:
-            calls.append(("billing_field_check", {"entities": req.entities}))
-
-        if not calls:
-            return replace(req)
-
-        call_context = ToolCallContext(
-            request_id=req.request_id,
-            caller=agent_type.value,
-            user_id=req.user_id,
-            conv_id=req.conv_id,
-        )
-        tool_results: List[str] = []
-        for tool_name, params in calls:
-            result: ToolResult = await self._tool_manager.call(
-                tool_name,
-                params,
-                call_context,
-                context={"intent": req.intent.value if req.intent else None},
-            )
-            if result.success:
-                tool_results.append(
-                    f"- {tool_name}: {json.dumps(result.data, ensure_ascii=False)}"
-                )
-            else:
-                logger.warning(
-                    "领域工具未产生结果: request_id=%s agent=%s tool=%s error=%s",
-                    req.request_id,
-                    agent_type.value,
-                    tool_name,
-                    result.error,
-                )
-
-        if not tool_results:
-            return replace(req)
-
-        parts = [part for part in (req.context, "[确定性工具结果]\n" + "\n".join(tool_results)) if part]
-        return replace(req, context="\n\n".join(parts))
 
     # ── 统计（供 Monitor 读取）────────────────────────────────────────────────
 

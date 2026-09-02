@@ -1,5 +1,6 @@
 """Provider-neutral async text generation for Anthropic and OpenAI APIs."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import os
 import re
 from types import SimpleNamespace
@@ -25,6 +26,26 @@ class LLMRuntime:
 
     config: LLMConfig
     client: Any
+
+
+@dataclass(frozen=True)
+class UnifiedToolCall:
+    """Provider-neutral structured request to execute one local function tool."""
+
+    id: str
+    name: str
+    arguments: Dict[str, Any]
+
+
+@dataclass
+class UnifiedLLMResponse:
+    """Minimal response shape consumed by PkkMind across all providers."""
+
+    content: List[Any]
+    tool_calls: List[UnifiedToolCall]
+    stop_reason: Optional[str] = None
+    provider_items: List[Any] = field(default_factory=list)
+    raw: Any = None
 
 
 def load_llm_config() -> LLMConfig:
@@ -176,11 +197,151 @@ def build_component_llm_runtimes(
     return runtimes
 
 
-def _text_response(text: str) -> Any:
-    """Return the small Anthropic-compatible response shape used by the app."""
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)] if text else []
+def _unified_response(
+    text: str,
+    *,
+    tool_calls: Optional[List[UnifiedToolCall]] = None,
+    stop_reason: Optional[str] = None,
+    provider_items: Optional[List[Any]] = None,
+    raw: Any = None,
+) -> UnifiedLLMResponse:
+    """Return the Anthropic-like text blocks historically consumed by the app."""
+    return UnifiedLLMResponse(
+        content=[SimpleNamespace(type="text", text=text)] if text else [],
+        tool_calls=list(tool_calls or []),
+        stop_reason=stop_reason,
+        provider_items=list(provider_items or []),
+        raw=raw,
     )
+
+
+def _parse_arguments(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value or "{}")
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _tool_call_dict(call: Any) -> Dict[str, Any]:
+    if isinstance(call, UnifiedToolCall):
+        return {"id": call.id, "name": call.name, "arguments": call.arguments}
+    if isinstance(call, dict):
+        return {
+            "id": str(call.get("id", "")),
+            "name": str(call.get("name", "")),
+            "arguments": _parse_arguments(call.get("arguments", {})),
+        }
+    return {
+        "id": str(getattr(call, "id", "")),
+        "name": str(getattr(call, "name", "")),
+        "arguments": _parse_arguments(getattr(call, "arguments", {})),
+    }
+
+
+def _chat_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    converted: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            tool_calls = []
+            for item in message["tool_calls"]:
+                call = _tool_call_dict(item)
+                tool_calls.append({
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                    },
+                })
+            converted.append({
+                "role": "assistant",
+                "content": message.get("content") or None,
+                "tool_calls": tool_calls,
+            })
+        elif role == "tool":
+            converted.append({
+                "role": "tool",
+                "tool_call_id": message.get("tool_call_id", ""),
+                "content": str(message.get("content", "")),
+            })
+        else:
+            converted.append(dict(message))
+    return converted
+
+
+def _responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    converted: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            provider_items = message.get("provider_items") or []
+            if provider_items:
+                converted.extend(provider_items)
+                continue
+            if message.get("content"):
+                converted.append({"role": "assistant", "content": message["content"]})
+            for item in message["tool_calls"]:
+                call = _tool_call_dict(item)
+                converted.append({
+                    "type": "function_call",
+                    "call_id": call["id"],
+                    "name": call["name"],
+                    "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                })
+        elif role == "tool":
+            converted.append({
+                "type": "function_call_output",
+                "call_id": message.get("tool_call_id", ""),
+                "output": str(message.get("content", "")),
+            })
+        else:
+            converted.append(dict(message))
+    return converted
+
+
+def _anthropic_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    converted: List[Dict[str, Any]] = []
+    pending_results: List[Dict[str, Any]] = []
+
+    def flush_results() -> None:
+        nonlocal pending_results
+        if pending_results:
+            converted.append({"role": "user", "content": pending_results})
+            pending_results = []
+
+    for message in messages:
+        role = message.get("role")
+        if role == "tool":
+            pending_results.append({
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id", ""),
+                "content": str(message.get("content", "")),
+            })
+            continue
+        flush_results()
+        if role == "assistant" and message.get("tool_calls"):
+            content: List[Dict[str, Any]] = []
+            if message.get("content"):
+                content.append({"type": "text", "text": str(message["content"])})
+            for item in message["tool_calls"]:
+                call = _tool_call_dict(item)
+                content.append({
+                    "type": "tool_use",
+                    "id": call["id"],
+                    "name": call["name"],
+                    "input": call["arguments"],
+                })
+            converted.append({"role": "assistant", "content": content})
+        else:
+            converted.append(dict(message))
+    flush_results()
+    return converted
 
 
 def _extract_responses_text(response: Any) -> str:
@@ -217,14 +378,80 @@ def _extract_chat_text(response: Any) -> str:
     return "\n".join(texts)
 
 
-class OpenAIMessageAdapter:
-    """Expose OpenAI Responses/Chat Completions through ``messages.create``."""
+def _extract_chat_tool_calls(response: Any) -> List[UnifiedToolCall]:
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return []
+    message = getattr(choices[0], "message", None)
+    calls: List[UnifiedToolCall] = []
+    for item in getattr(message, "tool_calls", None) or []:
+        function = getattr(item, "function", None)
+        if isinstance(item, dict):
+            function = item.get("function", function)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+        if isinstance(function, dict):
+            name = function.get("name", name)
+            arguments = function.get("arguments", arguments)
+        call_id = getattr(item, "id", None)
+        if isinstance(item, dict):
+            call_id = item.get("id", call_id)
+        if name:
+            calls.append(UnifiedToolCall(
+                id=str(call_id or f"call_{len(calls)}"),
+                name=str(name),
+                arguments=_parse_arguments(arguments),
+            ))
+    return calls
 
-    def __init__(self, client: Any, api_style: str):
-        if api_style not in _SUPPORTED_OPENAI_STYLES:
-            raise ValueError(f"unsupported OpenAI API style: {api_style}")
+
+def _extract_responses_tool_calls(response: Any) -> List[UnifiedToolCall]:
+    calls: List[UnifiedToolCall] = []
+    for item in getattr(response, "output", None) or []:
+        item_type = getattr(item, "type", None)
+        if isinstance(item, dict):
+            item_type = item.get("type", item_type)
+        if item_type != "function_call":
+            continue
+        name = getattr(item, "name", None)
+        arguments = getattr(item, "arguments", None)
+        call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+        if isinstance(item, dict):
+            name = item.get("name", name)
+            arguments = item.get("arguments", arguments)
+            call_id = item.get("call_id", item.get("id", call_id))
+        if name:
+            calls.append(UnifiedToolCall(
+                id=str(call_id or f"call_{len(calls)}"),
+                name=str(name),
+                arguments=_parse_arguments(arguments),
+            ))
+    return calls
+
+
+def _responses_provider_items(response: Any) -> List[Dict[str, Any]]:
+    """Preserve Responses reasoning/function items required for stateless tool turns."""
+    items: List[Dict[str, Any]] = []
+    for item in getattr(response, "output", None) or []:
+        if isinstance(item, dict):
+            items.append(dict(item))
+            continue
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                items.append(dumped)
+    return items
+
+
+class AnthropicMessageAdapter:
+    """Normalize Anthropic Messages text and ``tool_use`` blocks."""
+
+    supports_tool_calling = True
+    supports_named_tool_choice = True
+
+    def __init__(self, client: Any):
         self._client = client
-        self._api_style = api_style
         self.messages = self
 
     async def create(
@@ -235,21 +462,126 @@ class OpenAIMessageAdapter:
         max_tokens: int,
         system: Optional[str] = None,
         temperature: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        **_: Any,
+    ) -> UnifiedLLMResponse:
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "messages": _anthropic_messages(messages),
+            "max_tokens": max_tokens,
+        }
+        if system:
+            kwargs["system"] = system
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if tools:
+            kwargs["tools"] = [
+                {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "input_schema": tool.get("parameters", {"type": "object"}),
+                }
+                for tool in tools
+            ]
+            if tool_choice in ("auto", "required"):
+                kwargs["tool_choice"] = {"type": "auto" if tool_choice == "auto" else "any"}
+            elif tool_choice and tool_choice != "none":
+                kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+
+        response = await self._client.messages.create(**kwargs)
+        text_parts: List[str] = []
+        tool_calls: List[UnifiedToolCall] = []
+        for block in getattr(response, "content", None) or []:
+            block_type = getattr(block, "type", None)
+            if isinstance(block, dict):
+                block_type = block.get("type", block_type)
+            if block_type == "text":
+                text = getattr(block, "text", None)
+                if isinstance(block, dict):
+                    text = block.get("text", text)
+                if isinstance(text, str):
+                    text_parts.append(text)
+            elif block_type == "tool_use":
+                call_id = getattr(block, "id", None)
+                name = getattr(block, "name", None)
+                arguments = getattr(block, "input", None)
+                if isinstance(block, dict):
+                    call_id = block.get("id", call_id)
+                    name = block.get("name", name)
+                    arguments = block.get("input", arguments)
+                if name:
+                    tool_calls.append(UnifiedToolCall(
+                        id=str(call_id or f"call_{len(tool_calls)}"),
+                        name=str(name),
+                        arguments=_parse_arguments(arguments),
+                    ))
+        return _unified_response(
+            "\n".join(text_parts),
+            tool_calls=tool_calls,
+            stop_reason=getattr(response, "stop_reason", None),
+            raw=response,
+        )
+
+
+class OpenAIMessageAdapter:
+    """Expose OpenAI Responses/Chat Completions through ``messages.create``."""
+
+    def __init__(self, client: Any, api_style: str):
+        if api_style not in _SUPPORTED_OPENAI_STYLES:
+            raise ValueError(f"unsupported OpenAI API style: {api_style}")
+        self._client = client
+        self._api_style = api_style
+        self.messages = self
+        self.supports_tool_calling = True
+        self.supports_named_tool_choice = True
+
+    async def create(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        max_tokens: int,
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         **_: Any,
     ) -> Any:
         if self._api_style == "responses":
             kwargs: Dict[str, Any] = {
                 "model": model,
-                "input": messages,
+                "input": _responses_input(messages),
                 "max_output_tokens": max_tokens,
             }
             if system:
                 kwargs["instructions"] = system
+            if tools:
+                kwargs["parallel_tool_calls"] = False
+                kwargs["tools"] = [
+                    {
+                        "type": "function",
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {"type": "object"}),
+                    }
+                    for tool in tools
+                ]
+                if tool_choice in ("auto", "required", "none"):
+                    kwargs["tool_choice"] = tool_choice
+                elif tool_choice:
+                    kwargs["tool_choice"] = {"type": "function", "name": tool_choice}
             # Reasoning models may reject temperature, so Responses calls omit it.
             response = await self._client.responses.create(**kwargs)
-            return _text_response(_extract_responses_text(response))
+            return _unified_response(
+                _extract_responses_text(response),
+                tool_calls=_extract_responses_tool_calls(response),
+                stop_reason=getattr(response, "status", None),
+                provider_items=_responses_provider_items(response),
+                raw=response,
+            )
 
-        chat_messages = list(messages)
+        chat_messages = _chat_messages(messages)
         if system:
             chat_messages = [{"role": "system", "content": system}] + chat_messages
         kwargs = {
@@ -259,8 +591,35 @@ class OpenAIMessageAdapter:
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
+        if tools:
+            kwargs["parallel_tool_calls"] = False
+            kwargs["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("parameters", {"type": "object"}),
+                    },
+                }
+                for tool in tools
+            ]
+            if tool_choice in ("auto", "required", "none"):
+                kwargs["tool_choice"] = tool_choice
+            elif tool_choice:
+                kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": tool_choice},
+                }
         response = await self._client.chat.completions.create(**kwargs)
-        return _text_response(_extract_chat_text(response))
+        choices = getattr(response, "choices", None) or []
+        finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+        return _unified_response(
+            _extract_chat_text(response),
+            tool_calls=_extract_chat_tool_calls(response),
+            stop_reason=finish_reason,
+            raw=response,
+        )
 
 
 def create_llm_client(config: LLMConfig) -> Any:
@@ -271,7 +630,7 @@ def create_llm_client(config: LLMConfig) -> Any:
         kwargs: Dict[str, Any] = {"api_key": config.api_key}
         if config.base_url:
             kwargs["base_url"] = config.base_url
-        return AsyncAnthropic(**kwargs)
+        return AnthropicMessageAdapter(AsyncAnthropic(**kwargs))
 
     from openai import AsyncOpenAI
 
